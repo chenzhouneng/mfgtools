@@ -66,6 +66,7 @@ struct BootData
 
 #pragma pack ()
 
+#define ROM_KERNEL_CMD_RD_MEM							0x0101
 #define ROM_KERNEL_CMD_WR_MEM							0x0202
 #define ROM_KERNEL_CMD_WR_FILE							0x0404
 #define ROM_KERNEL_CMD_ERROR_STATUS				0x0505
@@ -84,10 +85,6 @@ struct BootData
 #define IVT_BARKER2_HEADER				0x412000D1
 
 #define HAB_TAG_DCD							0xd2       /**< Device Configuration Data */
-
-#define ROM_WRITE_ACK						0x128A8A12
-#define ROM_STATUS_ACK					0x88888888
-#define ROM_OK_ACK						0x900DD009
 
 class SDPCmdBase:public CmdBase
 {
@@ -183,6 +180,40 @@ public:
 
 };
 
+class SDPReadMemCmd : public SDPCmdBase
+{
+public:
+	uint32_t m_mem_addr;
+	uint8_t m_mem_format;
+
+	SDPReadMemCmd(char*p) :SDPCmdBase(p) {
+		m_spdcmd.m_cmd = ROM_KERNEL_CMD_RD_MEM;
+
+		insert_param_info("rdmem", NULL, Param::e_null);
+		insert_param_info("-addr", &m_mem_addr, Param::e_uint32);
+		insert_param_info("-format", &m_mem_format, Param::e_uint32);
+	}
+	int run(CmdCtx *);
+};
+
+class SDPWriteMemCmd : public SDPCmdBase
+{
+public:
+	uint32_t m_mem_addr;
+	uint8_t m_mem_format;
+	uint32_t m_mem_value;
+
+	SDPWriteMemCmd(char*p) :SDPCmdBase(p) {
+		m_spdcmd.m_cmd = ROM_KERNEL_CMD_WR_MEM;
+
+		insert_param_info("wrmem", NULL, Param::e_null);
+		insert_param_info("-addr", &m_mem_addr, Param::e_uint32);
+		insert_param_info("-format", &m_mem_format, Param::e_uint32);
+		insert_param_info("-value", &m_mem_value, Param::e_uint32);
+	}
+	int run(CmdCtx *p);
+};
+
 class SDPWriteCmd : public SDPCmdBase
 {
 public:
@@ -193,6 +224,7 @@ public:
 	uint32_t m_offset;
 	bool m_bIvtReserve;
 	bool m_bskipspl;
+	bool m_bskipfhdr;
 
 	SDPWriteCmd(char*p) :SDPCmdBase(p) {
 		m_spdcmd.m_cmd = ROM_KERNEL_CMD_WR_FILE;
@@ -210,6 +242,7 @@ public:
 		insert_param_info("-addr", &m_download_addr, Param::e_uint32);
 		insert_param_info("-offset", &m_offset, Param::e_uint32);
 		insert_param_info("-skipspl", &m_bskipspl, Param::e_bool);
+		insert_param_info("-skipfhdr", &m_bskipfhdr, Param::e_bool);
 	};
 
 	int run(CmdCtx *p);

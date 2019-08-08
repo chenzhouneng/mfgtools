@@ -1,3 +1,8 @@
+cmake_minimum_required(VERSION 3.4)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0>=1.0.16)
 pkg_check_modules(LIBZIP REQUIRED libzip)
@@ -5,9 +10,9 @@ pkg_check_modules(LIBZ REQUIRED zlib)
 find_package(Threads)
 
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")
 
-if (NOT APPLE)
+if (STATIC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libstdc++ -static-libgcc")
 endif()
 
@@ -20,6 +25,7 @@ set(LSTS
 	sd_burn_loader.lst
 	spl_boot.lst
 	sd_burn_all.lst
+	nand_burn_loader.lst
 )
 
 link_directories(${CMAKE_CURRENT_SOURCE_DIR}/libuuu ${LIBUSB_LIBRARY_DIRS} ${LIBZIP_LIBRARY_DIRS} ${LIBZ_LIBRARY_DIRS})

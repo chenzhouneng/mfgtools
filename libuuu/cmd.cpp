@@ -129,7 +129,20 @@ int CmdBase::parser(char *p)
 	return 0;
 }
 
-int CmdList::run_all(CmdCtx *p, bool dry_run)
+int CmdBase::dump()
+{
+	uuu_notify nt;
+	nt.type = uuu_notify::NOTIFY_CMD_INFO;
+
+	string str =  m_cmd;
+	str += "\n";
+	nt.str = (char*)str.c_str();
+	call_notify(nt);
+
+	return 0;
+}
+
+int CmdList::run_all(CmdCtx *p, bool dry)
 {
 	CmdList::iterator it;
 	int ret;
@@ -143,30 +156,29 @@ int CmdList::run_all(CmdCtx *p, bool dry_run)
 
 	for (it = begin(); it != end(); it++, i++)
 	{
-		if (dry_run)
-		{
-			(*it)->dump();
-		}
+		uuu_notify nt;
+
+		nt.type = uuu_notify::NOTIFY_CMD_INDEX;
+		nt.index = i;
+		call_notify(nt);
+
+		nt.type = uuu_notify::NOTIFY_CMD_START;
+		nt.str = (char *)(*it)->m_cmd.c_str();
+		call_notify(nt);
+
+		if (dry)
+			ret = (*it)->dump();
 		else
-		{
-			uuu_notify nt;
-
-			nt.type = uuu_notify::NOTIFY_CMD_INDEX;
-			nt.index = i;
-			call_notify(nt);
-
-			nt.type = uuu_notify::NOTIFY_CMD_START;
-			nt.str = (char *)(*it)->m_cmd.c_str();
-			call_notify(nt);
-
 			ret = (*it)->run(p);
 
-			nt.type = uuu_notify::NOTIFY_CMD_END;
-			nt.status = ret;
-			call_notify(nt);
-			if (ret)
-				return ret;
-		}
+		nt.type = uuu_notify::NOTIFY_CMD_END;
+		nt.status = ret;
+		call_notify(nt);
+		if (ret)
+			return ret;
+
+		if ((*it)->m_lastcmd)
+				break;
 	}
 	return ret;
 }
@@ -256,6 +268,8 @@ CmdObjCreateMap::CmdObjCreateMap()
 
 	(*this)["SDP:DCD"] = new_cmd_obj<SDPDcdCmd>;
 	(*this)["SDP:JUMP"] = new_cmd_obj<SDPJumpCmd>;
+	(*this)["SDP:RDMEM"] = new_cmd_obj<SDPReadMemCmd>;
+	(*this)["SDP:WRMEM"] = new_cmd_obj<SDPWriteMemCmd>;
 	(*this)["SDP:WRITE"] = new_cmd_obj<SDPWriteCmd>;
 	(*this)["SDP:STATUS"] = new_cmd_obj<SDPStatusCmd>;
 	(*this)["SDP:BOOT"] = new_cmd_obj<SDPBootCmd>;
@@ -285,6 +299,8 @@ CmdObjCreateMap::CmdObjCreateMap()
 	(*this)["FASTBOOT:OEM"] = new_cmd_obj<FBOemCmd>;
 	(*this)["FB:FLASHING"] = new_cmd_obj<FBFlashingCmd>;
 	(*this)["FASTBOOT:FLASHING"] = new_cmd_obj<FBFlashingCmd>;
+	(*this)["FB:SET_ACTIVE"] = new_cmd_obj<FBSetActiveCmd>;
+	(*this)["FASTBOOT:SET_ACTIVE"] = new_cmd_obj<FBSetActiveCmd>;
 
 	(*this)["FBK:UCMD"] = new_cmd_obj<FBUCmd>;
 	(*this)["FBK:ACMD"] = new_cmd_obj<FBACmd>;
@@ -333,7 +349,7 @@ shared_ptr<CmdBase> create_cmd_obj(string cmd)
 	return NULL;
 }
 
-int uuu_run_cmd(const char * cmd)
+int uuu_run_cmd(const char * cmd, int dry)
 {
 	shared_ptr<CmdBase> p;
 	p = create_cmd_obj(cmd);
@@ -355,7 +371,7 @@ int uuu_run_cmd(const char * cmd)
 	{
 		size_t pos = 0;
 		string c = cmd;
-		
+
 		string pro = get_next_param(c, pos, ':');
 		pro = remove_square_brackets(pro);
 		pro += ":";
@@ -364,17 +380,23 @@ int uuu_run_cmd(const char * cmd)
 			ret = -1;
 		else
 		{
-			CmdUsbCtx ctx;
-			ret = ctx.look_for_match_device(pro.c_str());
-			if (ret)
-				return ret;
+			if (dry)
+			{
+				ret = p->dump();
+			}else
+			{
+				CmdUsbCtx ctx;
+				ret = ctx.look_for_match_device(pro.c_str());
+				if (ret)
+					return ret;
 
-			ret = p->run(&ctx);
+				ret = p->run(&ctx);
+			}
 		}
 	}
 	else
 	{
-		return ret =p->run(NULL);
+		return ret = dry? p->dump() : p->run(NULL);
 	}
 
 	nt.type = uuu_notify::NOTIFY_CMD_END;
@@ -474,7 +496,7 @@ int CmdShell::run(CmdCtx*)
 			if (pos != string::npos)
 				cmd = cmd.substr(0, pos);
 
-			return uuu_run_cmd(cmd.c_str());
+			return uuu_run_cmd(cmd.c_str(), 0);
 		}
 		uuu_notify nt;
 		nt.type = uuu_notify::NOTIFY_CMD_INFO;
@@ -636,11 +658,10 @@ int check_version(string str)
 	return 0;
 }
 
-int uuu_run_cmd_script(const char * buff)
+int uuu_run_cmd_script(const char * buff, int dry)
 {
-	shared_ptr<FileBuffer> p(new FileBuffer);
-	p->m_data.resize(strlen(buff));
-	memcpy(p->m_data.data(), buff, strlen(buff));
+	shared_ptr<FileBuffer> p(new FileBuffer((void*)buff, strlen(buff)));
+	
 	return parser_cmd_list_file(p);
 }
 
@@ -739,10 +760,22 @@ int notify_done(uuu_notify nt, void *p)
 
 	return 0;
 }
-int uuu_wait_uuu_finish(int deamon)
+int uuu_wait_uuu_finish(int deamon, int dry)
 {
 	std::atomic<int> exit;
 	exit = 0;
+
+	if(dry) {
+		for(auto it=g_cmd_map.begin(); it != g_cmd_map.end(); it++)
+		{
+			for(auto cmd = it->second->begin(); cmd != it->second->end(); cmd++)
+			{
+				(*cmd)->dump();
+			}
+		}
+		return 0;
+	}
+
 	if (!deamon)
 		uuu_register_notify_callback(notify_done, &exit);
 

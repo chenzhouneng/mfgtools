@@ -63,8 +63,6 @@ int FastBoot::Transport(string cmd, void *p, size_t size, vector<uint8_t> *input
 		{
 			size_t sz;
 			sz = strtoul(buff+4, NULL, 16);
-			if (sz > size)
-				sz = size;
 
 			if (input)
 			{
@@ -76,6 +74,9 @@ int FastBoot::Transport(string cmd, void *p, size_t size, vector<uint8_t> *input
 			}
 			else
 			{
+				if (sz > size)
+					sz = size;
+
 				if (m_pTrans->write(p, sz))
 					return -1;
 			}
@@ -443,19 +444,31 @@ int FBFlashCmd::flash_raw2sparse(FastBoot *fb, shared_ptr<FileBuffer> pdata, siz
 {
 	SparseFile sf;
 
+	vector<uint8_t> data;
+
 	if (max > 0x1000000)
 		 max = 0x1000000;
 
 	sf.init_header(block_size, (max + block_size -1) / block_size);
 
-	uuu_notify nt;
-	nt.type = uuu_notify::NOTIFY_TRANS_SIZE;
-	nt.total = pdata->size();
-	call_notify(nt);
+	data.resize(block_size);
 
-	for (size_t i = 0; i < pdata->size(); i += block_size)
+	uuu_notify nt;
+	bool bload = pdata->IsKnownSize();
+
+	nt.type = uuu_notify::NOTIFY_TRANS_SIZE;
+	if (bload)
+		nt.total = pdata->size();
+	else
+		nt.total = 0;
+
+	call_notify(nt);
+	
+
+	size_t i = 0;
+	while (!pdata->request_data(data, i*block_size, block_size))
 	{
-		int ret = sf.push_one_block(pdata->data() + i);
+		int ret = sf.push_one_block(data.data());
 		if (ret)
 		{
 			if (flash(fb, sf.m_data.data(), sf.m_data.size()))
@@ -465,15 +478,26 @@ int FBFlashCmd::flash_raw2sparse(FastBoot *fb, shared_ptr<FileBuffer> pdata, siz
 
 			chunk_header_t ct;
 			ct.chunk_type = CHUNK_TYPE_DONT_CARE;
-			ct.chunk_sz = i / block_size + 1;
+			ct.chunk_sz = i + 1;
 			ct.reserved1 = 0;
 			ct.total_sz = sizeof(ct);
 
 			sf.push_one_chuck(&ct, NULL);
 
 			nt.type = uuu_notify::NOTIFY_TRANS_POS;
-			nt.total = i;
+			nt.total = i * block_size;
 			call_notify(nt);
+		}
+
+		i++;
+
+		if (bload != pdata->IsKnownSize())
+		{
+			nt.type = uuu_notify::NOTIFY_TRANS_SIZE;
+			nt.total = pdata->size();
+			call_notify(nt);
+
+			bload = pdata->IsKnownSize();
 		}
 	}
 
@@ -517,14 +541,15 @@ int FBFlashCmd::run(CmdCtx *ctx)
 	FastBoot fb(&dev);
 	dev.m_timeout = m_timeout;
 
+	if (m_raw2sparse)
+	{
+		shared_ptr<FileBuffer> pdata = get_file_buffer(m_filename, true);
+		return flash_raw2sparse(&fb, pdata, block_size, max);
+	}
+
 	shared_ptr<FileBuffer> pdata = get_file_buffer(m_filename);
 	if (pdata == NULL)
 		return -1;
-
-	if (m_raw2sparse)
-	{
-		return flash_raw2sparse(&fb, pdata, block_size, max);
-	}
 
 	if (SparseFile::is_validate_sparse_file(pdata->data(), pdata->size()))
 	{	/* Limited max size to 16M for sparse file to avoid long timeout at read status*/

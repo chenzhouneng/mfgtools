@@ -113,11 +113,11 @@ Zip_file_Info::~Zip_file_Info()
 	memset(&m_strm, 0, sizeof(m_strm));
 }
 
-shared_ptr<FileBuffer>	Zip_file_Info::decompress(Zip *pZip)
+int	Zip_file_Info::decompress(Zip *pZip, shared_ptr<FileBuffer>p)
 {
-	shared_ptr<FileBuffer> p(new FileBuffer);
 	p->resize(m_filesize);
-
+	atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_KNOWN_SIZE);
+	
 	uuu_notify ut;
 	ut.type = uuu_notify::NOTIFY_DECOMPRESS_SIZE;
 	ut.total = m_filesize;
@@ -138,7 +138,7 @@ shared_ptr<FileBuffer>	Zip_file_Info::decompress(Zip *pZip)
 	if (file_desc.sign != FILE_SIGNATURE)
 	{
 		set_last_err_string("file signature miss matched");
-		return NULL;
+		return -1;
 	}
 
 	size_t off = sizeof(file_desc) + file_desc.file_name_length + file_desc.extrafield_length;
@@ -164,7 +164,7 @@ shared_ptr<FileBuffer>	Zip_file_Info::decompress(Zip *pZip)
 		/* run inflate() on input until output buffer not full */
 		do {
 			m_strm.avail_out = CHUNK;
-			m_strm.next_out = &((*p)[pos]);
+			m_strm.next_out = p->data() + pos;
 			ret = inflate(&m_strm, Z_NO_FLUSH);
 			//assert(ret != Z_STREAM_ERROR);  /* state not clobbered */
 			switch (ret) {
@@ -173,9 +173,13 @@ shared_ptr<FileBuffer>	Zip_file_Info::decompress(Zip *pZip)
 			case Z_DATA_ERROR:
 			case Z_MEM_ERROR:
 				(void)inflateEnd(&m_strm);
-				return NULL;
+				return -1;
 			}
 			size_t have = CHUNK - m_strm.avail_out;
+
+			p->m_avaible_size = pos;
+			p->m_request_cv.notify_all();
+
 			pos += have;
 		} while (m_strm.avail_out == 0);
 
@@ -196,12 +200,16 @@ shared_ptr<FileBuffer>	Zip_file_Info::decompress(Zip *pZip)
 	if (ret != Z_STREAM_END)
 	{
 		set_last_err_string("decompress error");
-		return NULL;
+		return -1;
 	}
+
+	p->m_avaible_size = m_filesize;
+	atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_LOADED);
+	p->m_request_cv.notify_all();
 
 	ut.type = uuu_notify::NOTIFY_DECOMPRESS_POS;
 	ut.index = m_filesize;
 	call_notify(ut);
 
-	return p;
+	return 0;
 }

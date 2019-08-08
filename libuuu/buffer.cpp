@@ -41,6 +41,7 @@
 #include <string.h>
 #include "bzlib.h"
 #include "stdio.h"
+#include <limits>
 
 #ifdef _MSC_VER
 #define stat64 _stat64
@@ -67,7 +68,7 @@ public:
 	const char * m_ext;
 	FSBasic() { m_ext = NULL; }
 	virtual int get_file_timesample(string filename, uint64_t *ptime)=0;
-	virtual int load(string backfile, string filename, FileBuffer *p, bool async)=0;
+	virtual int load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async)=0;
 	virtual bool exist(string backfile, string filename)=0;
 	virtual int for_each_ls(uuu_ls_file fn, string backfile, string filename, void *p) = 0;
 	int split(string filename, string *outbackfile, string *outfilename, bool dir=false)
@@ -141,7 +142,7 @@ public:
 		return stat64(backfile.c_str() + 1, &st) == 0 && ((st.st_mode & S_IFDIR) == 0);
 	}
 
-	int load(string backfile, string filename, FileBuffer *p, bool async)
+	int load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async)
 	{
 		struct stat64 st;
 		if (stat64(backfile.c_str() + 1, &st))
@@ -154,7 +155,10 @@ public:
 		if (p->mapfile(backfile.substr(1), st.st_size))
 			return -1;
 
-		p->m_loaded = true;
+		p->m_avaible_size = st.st_size;
+		
+		atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_LOADED);
+
 		return 0;
 	}
 
@@ -227,7 +231,7 @@ static class FSZip : public FSBackFile
 {
 public:
 	FSZip() { m_ext = ".ZIP"; };
-	virtual int load(string backfile, string filename, FileBuffer *p, bool async);
+	virtual int load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async);
 	virtual bool exist(string backfile, string filename);
 	int for_each_ls(uuu_ls_file fn, string backfile, string filename, void *p);
 }g_fszip;
@@ -236,7 +240,7 @@ static class FSFat : public FSBackFile
 {
 public:
 	FSFat() { m_ext = ".SDCARD"; };
-	virtual int load(string backfile, string filename, FileBuffer *p, bool async);
+	virtual int load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async);
 	virtual bool exist(string backfile, string filename);
 	int for_each_ls(uuu_ls_file fn, string backfile, string filename, void *p);
 }g_fsfat;
@@ -245,7 +249,7 @@ static class FSBz2 : public FSBackFile
 {
 public:
 	FSBz2() { m_ext = ".BZ2"; };
-	virtual int load(string backfile, string filename, FileBuffer *p, bool async);
+	virtual int load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async);
 	virtual bool exist(string backfile, string filename);
 	int for_each_ls(uuu_ls_file fn, string backfile, string filename, void *p);
 }g_fsbz2;
@@ -304,7 +308,7 @@ public:
 		}
 		return false;
 	}
-	int load(string filename, FileBuffer *p, bool async)
+	int load(string filename, shared_ptr<FileBuffer> p, bool async)
 	{
 		for (int i = 0; i < m_pFs.size(); i++)
 		{
@@ -361,7 +365,7 @@ int FSZip::for_each_ls(uuu_ls_file fn, string backfile, string filename, void *p
 	return 0;
 }
 
-int zip_async_load(string zipfile, string fn, FileBuffer * buff)
+int zip_async_load(string zipfile, string fn, shared_ptr<FileBuffer> buff)
 {
 	std::lock_guard<mutex> lock(buff->m_async_mutex);
 
@@ -369,16 +373,17 @@ int zip_async_load(string zipfile, string fn, FileBuffer * buff)
 	if (zip.Open(zipfile.substr(1)))
 		return -1;
 
-	shared_ptr<FileBuffer> p = zip.get_file_buff(fn);
-	if (p == NULL)
+	if(zip.get_file_buff(fn, buff))
 		return -1;
 
-	buff->swap(*p);
-	buff->m_loaded = true;
+	buff->m_avaible_size = buff->m_DataSize;
+	atomic_fetch_or(&buff->m_dataflags, FILEBUFFER_FLAG_LOADED);
+
+	buff->m_request_cv.notify_all();
 	return 0;
 }
 
-int FSZip::load(string backfile, string filename, FileBuffer *p, bool async)
+int FSZip::load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async)
 {
 	Zip zip;
 
@@ -394,12 +399,10 @@ int FSZip::load(string backfile, string filename, FileBuffer *p, bool async)
 	}
 	else
 	{
-		shared_ptr<FileBuffer> pzip = zip.get_file_buff(filename);
-		if (pzip == NULL)
+		if(zip.get_file_buff(filename, p))
 			return -1;
 
-		p->swap(*pzip);
-		p->m_loaded = true;
+		atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_LOADED);
 	}
 	return 0;
 }
@@ -414,19 +417,19 @@ bool FSFat::exist(string backfile, string filename)
 	return fat.m_filemap.find(filename) != fat.m_filemap.end();
 }
 
-int FSFat::load(string backfile, string filename, FileBuffer *p, bool async)
+int FSFat::load(string backfile, string filename, shared_ptr<FileBuffer> p, bool async)
 {
 	Fat fat;
 	if (fat.Open(backfile))
 	{
 		return -1;
 	}
-	shared_ptr<FileBuffer> pfat = fat.get_file_buff(filename);
-	if (pfat == NULL)
+	
+	if(fat.get_file_buff(filename, p))
 		return -1;
 
-	p->swap(*pfat);
-	p->m_loaded = true;
+	atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_LOADED);
+
 	return 0;
 }
 
@@ -482,26 +485,101 @@ struct bz2_blk
 	int	error;
 };
 
-int bz2_decompress(shared_ptr<FileBuffer> pbz, FileBuffer *p, vector<bz2_blk> * pblk, size_t start, size_t skip)
+class bz2_blks
 {
-	for (int i = start; i < pblk->size(); i += skip)
+public:
+	vector<bz2_blk> blk;
+	mutex blk_mutex;
+
+	condition_variable cv;
+	mutex con_mutex;
+
+	atomic<size_t> top;
+	atomic<size_t> bottom;
+	bz2_blks() { top = 0; bottom = ULLONG_MAX; }
+};
+
+int bz2_update_available(shared_ptr<FileBuffer> p, bz2_blks * pblk)
+{
+	lock_guard<mutex> lock(pblk->blk_mutex);
+	size_t sz = 0;
+	for (int i = 1; i < pblk->blk.size() - 1; i++)
 	{
-		unsigned int len;
-		if (i) /*skip first dummy one*/
-		{
-			(*pblk)[i].error = BZ2_bzBuffToBuffDecompress((char*)p->data() + pblk->at(i).decompress_offset,
-				&len,
-				(char*)pbz->data() + pblk->at(i).start,
-				pblk->at(i).size,
-				0,
-				0);
-			(*pblk)[i].actual_size = len;
-		}
+		if (pblk->blk[i].error)
+			break;
+
+		if (!pblk->blk[i].actual_size)
+			break;
+
+		sz += pblk->blk[i].actual_size;
 	}
+
+	p->m_avaible_size = sz;
+	p->m_request_cv.notify_all();
 	return 0;
 }
 
-int bz_async_load(string filename, FileBuffer *p)
+int bz2_decompress(shared_ptr<FileBuffer> pbz, shared_ptr<FileBuffer> p, bz2_blks * pblk)
+{
+	bz2_blk one;
+	size_t cur;
+	vector<uint8_t> buff;
+
+	while (pblk->top + 1 < pblk->bottom)
+	{
+		{
+			std::unique_lock<std::mutex> lck(pblk->con_mutex);
+			while (pblk->top + 1 >= pblk->blk.size()) {
+				pblk->cv.wait(lck);
+			}
+		}
+
+		{
+			lock_guard<mutex> lock(pblk->blk_mutex);
+			if (pblk->top < pblk->blk.size() - 1)
+			{
+				cur = pblk->top;
+				one = pblk->blk[pblk->top];
+				pblk->top++;
+			}
+			else
+			{
+				continue;
+			}
+		}
+
+		unsigned int len = one.decompress_size;
+		buff.resize(len);
+		one.error = BZ2_bzBuffToBuffDecompress((char*)buff.data(),
+			&len,
+			(char*)pbz->data() + one.start,
+			one.size,
+			0,
+			0);
+		one.actual_size = len;
+
+		{
+			lock_guard<mutex> lock(pblk->blk_mutex);
+			(*pblk).blk[cur] = one;
+		}
+
+
+		{
+			lock_guard<mutex> lock(p->m_data_mutex);
+			if (p->size() < one.decompress_offset + one.actual_size)
+				p->resize(one.decompress_offset + one.actual_size);
+
+			memcpy(p->data() + one.decompress_offset, buff.data(), one.actual_size);
+		}
+
+		bz2_update_available(p, pblk);
+
+	}
+
+	return 0;
+}
+
+int bz_async_load(string filename, shared_ptr<FileBuffer> p)
 {
 	shared_ptr<FileBuffer> pbz;
 
@@ -514,13 +592,32 @@ int bz_async_load(string filename, FileBuffer *p)
 		return -1;
 	}
 
-	vector<bz2_blk> blk;
+	bz2_blks blks;
 	bz2_blk one;
 	memset(&one, 0, sizeof(one));
-	blk.push_back(one);
+	blks.blk.push_back(one);
+	blks.top = 1;
+
 	size_t total = 0;
 
 	uint8_t *p1 = &pbz->at(0);
+
+	int nthread = thread::hardware_concurrency();
+
+	vector<thread> threads;
+
+	for (int i = 0; i < nthread; i++)
+	{
+		threads.push_back(thread(bz2_decompress, pbz, p, &blks));
+#ifdef WIN32
+		if( i!=0 )
+			SetThreadPriority(threads[i].native_handle(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+	}
+
+	p->reserve(pbz->size() * 5); //estimate uncompressed memory size;
+	atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_KNOWN_SIZE);
+
 
 	for (size_t i = 0; i < pbz->size() - 10; i++)
 	{
@@ -535,36 +632,45 @@ int bz_async_load(string filename, FileBuffer *p)
 				{     
 					/*which is valude bz2 header*/
 					struct bz2_blk one;
+					memset(&one, 0, sizeof(one));
+
 					one.start = i;
-		
-					blk[blk.size() - 1].size = i - blk[blk.size() - 1].start;
-					one.decompress_offset = blk[blk.size() - 1].decompress_offset + blk[blk.size() - 1].decompress_size;
-					one.decompress_size = (pbz->at(i + 3) - '0') * 100 * 1000; /* not l024 for bz2 */
+					{
+						lock_guard<mutex> lock(blks.blk_mutex);
 
-					blk.push_back(one);
+						blks.blk.back().size = i - blks.blk.back().start;
+						one.decompress_offset = blks.blk.back().decompress_offset + blks.blk.back().decompress_size;
+						one.decompress_size = (pbz->at(i + 3) - '0') * 100 * 1000; /* not l024 for bz2 */
 
+						blks.blk.push_back(one);
+					}
 					total += one.decompress_size;
+
+					blks.cv.notify_all();
 				}
 			}
 		}
 	}
 
-	if (blk.size() == 1) {
+	if (blks.blk.size() == 1) {
 		set_last_err_string("Can't find validate bz2 magic number");
 		return -1;
 	}
 
-	blk[blk.size() - 1].size = pbz->size() - blk[blk.size() - 1].start;
+	blks.blk.back().size = pbz->size() - blks.blk.back().start;
 
-	int nthread = thread::hardware_concurrency();
-
-	vector<thread> threads;
-	
-	p->resize(total);
-
-	for (int i = 0; i < nthread; i++)
 	{
-		threads.push_back(thread(bz2_decompress, pbz, p, &blk, i, nthread));
+		lock_guard<mutex> lock(p->m_data_mutex);
+		p->resize(total);
+	}
+
+	{
+		lock_guard<mutex> lock(blks.blk_mutex);
+		struct bz2_blk one;
+		memset(&one, 0, sizeof(one));
+		blks.blk.push_back(one);
+		blks.bottom = blks.blk.size();
+		blks.cv.notify_all();
 	}
 
 	for (int i = 0; i < nthread; i++)
@@ -572,29 +678,29 @@ int bz_async_load(string filename, FileBuffer *p)
 		threads[i].join();
 	}
 
-	for (int i = 1; i < blk.size(); i++)
+	for (int i = 1; i < blks.blk.size(); i++)
 	{
-		if (blk[i].error)
+		if (blks.blk[i].error)
 		{
 			set_last_err_string("decompress err");
 			return -1;
 		}
-		if ((blk[i].decompress_size != blk[i].actual_size) && (i != blk.size() - 1))
+		if ((blks.blk[i].decompress_size != blks.blk[i].actual_size) && (i != blks.blk.size() - 2))  /*two dummy blks (one header and other end)*/
 		{
 			set_last_err_string("bz2: only support last block less then other block");
 			return -1;
 		}
 	}
 
-	size_t sz =  blk[blk.size() - 1].decompress_size - blk[blk.size() - 1].actual_size;
+	bz2_update_available(p, &blks);
 
-	p->resize(total - sz);
-	p->m_loaded = true;
+	p->resize(p->m_avaible_size);
+	atomic_fetch_or(&p->m_dataflags, FILEBUFFER_FLAG_LOADED);
 
 	return 0;
 }
 
-int FSBz2::load(string backfile, string filename, FileBuffer *p, bool async)
+int FSBz2::load(string backfile, string filename, shared_ptr<FileBuffer>p, bool async)
 {
 	if (filename != "*")
 	{
@@ -612,9 +718,14 @@ int FSBz2::load(string backfile, string filename, FileBuffer *p, bool async)
 	}
 
 	p->m_aync_thread = thread(bz_async_load, backfile, p);
-	
-	if (!async)
+
+	if (!async) {
 		p->m_aync_thread.join();
+		if (! p->IsLoaded()) {
+			set_last_err_string("async data load failure\n");
+			return -1;
+		}
+	}
 
 	return 0;
 }
@@ -677,12 +788,17 @@ shared_ptr<FileBuffer> get_file_buffer(string filename, bool async)
 				return NULL;
 			}
 
-		if (!p->m_loaded && !async)
+		if (!p->IsLoaded() && !async)
 		{
 			std::lock_guard<mutex> lock(p->m_async_mutex);
 
 			if(p->m_aync_thread.joinable())
 				p->m_aync_thread.join();
+
+			if(!p->IsLoaded())
+			{
+				return NULL;
+			}
 		}
 
 		return p;
@@ -692,8 +808,9 @@ shared_ptr<FileBuffer> get_file_buffer(string filename, bool async)
 
 int FileBuffer::reload(string filename, bool async)
 {
-	m_loaded = false;
-	if (g_fs_data.load(filename, this, async) == 0)
+	atomic_init(&this->m_dataflags, 0);
+
+	if (g_fs_data.load(filename, shared_from_this(), async) == 0)
 	{
 		m_timesample = get_file_timesample(filename);
 		return 0;
@@ -701,9 +818,52 @@ int FileBuffer::reload(string filename, bool async)
 	return -1;
 }
 
-shared_ptr<FileBuffer> get_file_buffer(string filename)
+int FileBuffer::request_data(vector<uint8_t> &data, size_t offset, size_t sz)
 {
-	return get_file_buffer(filename, false);
+	bool needlock = false;
+
+	if (IsLoaded())
+	{
+		if (offset >= this->size())
+		{
+			data.clear();
+			set_last_err_string("request offset execeed memory size");
+			return -1;
+		}
+	}
+	else
+	{
+		std::unique_lock<std::mutex> lck(m_requext_cv_mutex);
+		while ((offset + sz > m_avaible_size) && !IsLoaded())
+		{
+			m_request_cv.wait(lck);
+		}
+
+		if (IsLoaded())
+		{
+			if (offset > m_avaible_size)
+			{
+				data.clear();
+				set_last_err_string("request offset execeed memory size");
+				return -1;
+			}
+		}
+		needlock = true;
+	}
+
+	size_t size = sz;
+	if (offset + size >= m_avaible_size)
+		size = m_avaible_size - offset;
+
+	data.resize(size);
+
+	if (needlock) m_data_mutex.lock();
+
+	memcpy(data.data(), this->data() + offset, size);
+
+	if (needlock) m_data_mutex.unlock();
+
+	return 0;
 }
 
 bool check_file_exist(string filename, bool start_async_load)
@@ -721,7 +881,7 @@ int file_overwrite_monitor(string filename, FileBuffer *p)
 	str = ">";
 	str += filename;
 
-	if(p->m_pMapbuffer)
+	if(p->m_pDatabuffer && p->m_allocate_way == FileBuffer::ALLOCATE_MMAP)
 	{
 		std::lock_guard<mutex> lock(g_mutex_map);
 		p->m_file_monitor.detach(); /*Detach itself, erase will delete p*/
